@@ -23,10 +23,9 @@ use windows::Win32::{
     },
     UI::{
         HiDpi::GetDpiForWindow,
-        Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow, DI_NORMAL, SW_HIDE, SW_SHOW,
-            ULW_ALPHA,
+            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow,
+            DI_NORMAL, SW_HIDE, SW_SHOW, ULW_ALPHA,
         },
     },
 };
@@ -207,7 +206,6 @@ impl GdiAAPainter {
         }
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetFocus(Some(self.hwnd));
         }
         self.show = true;
     }

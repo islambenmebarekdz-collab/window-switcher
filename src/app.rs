@@ -37,6 +37,7 @@ pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
+pub const WM_POWERBROADCAST: u32 = 0x0218;
 
 pub fn start(config: &Config) -> Result<()> {
     info!("start config={config:?}");
@@ -56,6 +57,9 @@ pub struct App {
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
+    original_foreground_hwnd: Option<HWND>,
+    keyboard_listener: Option<KeyboardListener>,
+    foreground_watcher: Option<ForegroundWatcher>,
 }
 
 impl App {
@@ -63,8 +67,8 @@ impl App {
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
-        let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
-        let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
+        let foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
+        let keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
 
         let trayicon = match config.trayicon {
             true => Some(TrayIcon::create()),
@@ -89,6 +93,9 @@ impl App {
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
+            original_foreground_hwnd: None,
+            keyboard_listener: Some(keyboard_listener),
+            foreground_watcher: Some(foreground_watcher),
         };
 
         app.set_trayicon();
@@ -235,7 +242,7 @@ impl App {
             WM_USER_SWITCH_APPS_CANCEL => {
                 debug!("message WM_USER_SWITCH_APPS_CANCEL");
                 let app = get_app(hwnd)?;
-                app.cancel_switch_app();
+                app.cancel_switch_app(true);
             }
             WM_USER_SWITCH_WINDOWS => {
                 debug!("message WM_USER_SWITCH_WINDOWS");
@@ -247,7 +254,9 @@ impl App {
                     .and_then(|state| state.apps.get(state.index).map(|(_, id)| *id))
                     .unwrap_or_else(get_foreground_window);
                 app.switch_windows(hwnd, reverse)?;
-                app.cancel_switch_app();
+                // Keep the window just activated by switch_windows; only close
+                // the switch-apps overlay without restoring the original window.
+                app.cancel_switch_app(false);
             }
             WM_USER_SWITCH_WINDOWS_DONE => {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
@@ -283,6 +292,26 @@ impl App {
                             }
                         }
                         _ => {}
+                    }
+                }
+            }
+            WM_POWERBROADCAST => {
+                let event = wparam.0 as u32;
+                if event == 0x0012 || event == 0x0007 { // PBT_APMRESUMEAUTOMATIC or PBT_APMRESUMESUSPEND
+                    debug!("System resume from sleep/standby detected. Re-installing keyboard hook...");
+                    if let Ok(app) = get_app(hwnd) {
+                        // Drop old listener and watcher first
+                        app.keyboard_listener = None;
+                        app.foreground_watcher = None;
+                        // Re-create new listener and watcher
+                        if let Ok(listener) = KeyboardListener::init(hwnd, &app.config.to_hotkeys()) {
+                            app.keyboard_listener = Some(listener);
+                            info!("Keyboard hook re-installed successfully after resume.");
+                        }
+                        if let Ok(watcher) = ForegroundWatcher::init(&app.config.switch_windows_blacklist) {
+                            app.foreground_watcher = Some(watcher);
+                            info!("Foreground watcher re-installed successfully after resume.");
+                        }
                     }
                 }
             }
@@ -386,6 +415,12 @@ impl App {
             "switch apps: reverse:{reverse}, state:{:?}",
             self.switch_apps_state
         );
+
+        // Remember where the user started so ESC can take them back.
+        if self.switch_apps_state.is_none() {
+            self.original_foreground_hwnd = Some(get_foreground_window());
+        }
+
         if let Some(state) = self.switch_apps_state.as_mut() {
             if reverse {
                 if state.index == 0 {
@@ -399,6 +434,13 @@ impl App {
                 state.index += 1;
             };
             debug!("switch apps: new index:{}", state.index);
+
+            // Actually activate the candidate window on every hop. The OS then
+            // emits genuine focus events, so screen readers (NVDA, Narrator...)
+            // announce the switch naturally - no synthetic events needed.
+            if let Some((_, target_hwnd)) = state.apps.get(state.index) {
+                set_foreground_window(*target_hwnd);
+            }
             return Ok(());
         }
         let windows = list_windows(
@@ -439,6 +481,13 @@ impl App {
         };
 
         let state = SwitchAppsState { apps, index };
+
+        // Actually activate the first candidate so screen readers announce it
+        // naturally through the genuine focus change.
+        if let Some((_, target_hwnd)) = state.apps.get(state.index) {
+            set_foreground_window(*target_hwnd);
+        }
+
         self.switch_apps_state = Some(state);
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())
@@ -455,6 +504,7 @@ impl App {
 
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
+            self.original_foreground_hwnd = None;
             if let Some((_, id)) = state.apps.get(state.index) {
                 set_foreground_window(*id);
             }
@@ -462,8 +512,16 @@ impl App {
         }
     }
 
-    fn cancel_switch_app(&mut self) {
+    fn cancel_switch_app(&mut self, restore_original: bool) {
         if let Some(state) = self.switch_apps_state.take() {
+            // On explicit cancel (ESC), take the user back where they started;
+            // the resulting genuine focus event makes screen readers announce it.
+            if restore_original {
+                if let Some(orig) = self.original_foreground_hwnd.take() {
+                    set_foreground_window(orig);
+                }
+            }
+            self.original_foreground_hwnd = None;
             self.painter.unpaint(state);
         }
     }
