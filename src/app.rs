@@ -55,6 +55,10 @@ pub struct App {
     config: Config,
     switch_windows_state: SwitchWindowsState,
     switch_apps_state: Option<SwitchAppsState>,
+    /// Our own most-recently-used order of app keys (front = most recent).
+    /// Kept independent of the live Z-order, which our per-hop activations
+    /// pollute, so the switcher stays ordered by genuine usage.
+    app_mru: Vec<String>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
     original_foreground_hwnd: Option<HWND>,
@@ -91,6 +95,7 @@ impl App {
                 modifier_released: true,
             },
             switch_apps_state: None,
+            app_mru: Vec::new(),
             cached_icons: Default::default(),
             painter,
             original_foreground_hwnd: None,
@@ -448,28 +453,56 @@ impl App {
             self.config.switch_apps_only_current_desktop(),
             self.is_admin,
         )?;
+        if windows.is_empty() {
+            return Ok(());
+        }
+
+        // Order the apps by our own MRU list rather than the live Z-order.
+        // The Z-order is unreliable here because activating each candidate
+        // while cycling (needed for screen-reader announcements) permanently
+        // reshuffles it. Instead we promote whatever is genuinely focused
+        // right now to the front, then fall back to the order we last showed,
+        // then append any apps we have never seen.
+        let foreground = get_foreground_window();
+        let foreground_key = windows
+            .iter()
+            .find(|(_, hwnds)| hwnds.iter().any(|(id, _)| *id == foreground))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = foreground_key {
+            self.app_mru.retain(|k| k != &key);
+            self.app_mru.insert(0, key);
+        }
+        let mut ordered: Vec<String> = self
+            .app_mru
+            .iter()
+            .filter(|k| windows.contains_key(*k))
+            .cloned()
+            .collect();
+        for key in windows.keys() {
+            if !ordered.iter().any(|k| k == key) {
+                ordered.push(key.clone());
+            }
+        }
+        // Persist the freshly computed order (also prunes closed apps).
+        self.app_mru = ordered.clone();
+
         let mut apps = vec![];
-        for (module_path, hwnds) in windows.iter() {
+        let mut keys = vec![];
+        for key in ordered {
+            let hwnds = &windows[&key];
             let module_hwnd = if is_iconic_window(hwnds[0].0) {
                 hwnds[hwnds.len() - 1].0
             } else {
                 hwnds[0].0
             };
-            let module_hicon = self
+            let module_hicon = *self
                 .cached_icons
-                .entry(module_path.clone())
+                .entry(key.clone())
                 .or_insert_with(|| {
-                    get_app_icon(
-                        &self.config.switch_apps_override_icons,
-                        module_path,
-                        module_hwnd,
-                    )
+                    get_app_icon(&self.config.switch_apps_override_icons, &key, module_hwnd)
                 });
-            apps.push((*module_hicon, module_hwnd));
-        }
-        let num_apps = apps.len() as i32;
-        if num_apps == 0 {
-            return Ok(());
+            apps.push((module_hicon, module_hwnd));
+            keys.push(key);
         }
 
         let index = if apps.len() == 1 {
@@ -480,7 +513,7 @@ impl App {
             1
         };
 
-        let state = SwitchAppsState { apps, index };
+        let state = SwitchAppsState { apps, keys, index };
 
         // Actually activate the first candidate so screen readers announce it
         // naturally through the genuine focus change.
@@ -505,6 +538,11 @@ impl App {
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
             self.original_foreground_hwnd = None;
+            // The committed app is now the most-recently-used one.
+            if let Some(key) = state.keys.get(state.index) {
+                self.app_mru.retain(|k| k != key);
+                self.app_mru.insert(0, key.clone());
+            }
             if let Some((_, id)) = state.apps.get(state.index) {
                 set_foreground_window(*id);
             }
@@ -555,5 +593,7 @@ struct SwitchWindowsState {
 #[derive(Debug)]
 pub struct SwitchAppsState {
     pub apps: Vec<(HICON, HWND)>,
+    /// App key parallel to `apps`, used to maintain the MRU order.
+    pub keys: Vec<String>,
     pub index: usize,
 }
