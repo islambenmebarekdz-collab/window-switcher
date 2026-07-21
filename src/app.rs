@@ -59,6 +59,12 @@ pub struct App {
     /// Kept independent of the live Z-order, which our per-hop activations
     /// pollute, so the switcher stays ordered by genuine usage.
     app_mru: Vec<String>,
+    /// Most-recently-used order of individual window handles (front = most
+    /// recent), stored as isize. Used to pick which window of a multi-window
+    /// app to activate, so switching to an app restores the window you last
+    /// used rather than the oldest one. Like `app_mru`, it is updated only on
+    /// genuine focus captures and commits, never on intermediate hops.
+    window_mru: Vec<isize>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
     original_foreground_hwnd: Option<HWND>,
@@ -96,6 +102,7 @@ impl App {
             },
             switch_apps_state: None,
             app_mru: Vec::new(),
+            window_mru: Vec::new(),
             cached_icons: Default::default(),
             painter,
             original_foreground_hwnd: None,
@@ -486,15 +493,27 @@ impl App {
         // Persist the freshly computed order (also prunes closed apps).
         self.app_mru = ordered.clone();
 
+        // Record the genuinely-focused window as its app's most-recent one, then
+        // drop closed windows. Like `app_mru`, `window_mru` is updated only here
+        // and on commit, never on intermediate hops, so our own per-hop
+        // activations cannot make it forget the window you last used.
+        let foreground_id = foreground.0 as isize;
+        let all_window_ids: std::collections::HashSet<isize> = windows
+            .values()
+            .flat_map(|hwnds| hwnds.iter().map(|(h, _)| h.0 as isize))
+            .collect();
+        // Drop the foreground (to re-add it at the front) and any closed windows.
+        self.window_mru
+            .retain(|id| *id != foreground_id && all_window_ids.contains(id));
+        if all_window_ids.contains(&foreground_id) {
+            self.window_mru.insert(0, foreground_id);
+        }
+
         let mut apps = vec![];
         let mut keys = vec![];
         for key in ordered {
             let hwnds = &windows[&key];
-            let module_hwnd = if is_iconic_window(hwnds[0].0) {
-                hwnds[hwnds.len() - 1].0
-            } else {
-                hwnds[0].0
-            };
+            let module_hwnd = self.pick_app_window(hwnds);
             let module_hicon = *self
                 .cached_icons
                 .entry(key.clone())
@@ -535,6 +554,26 @@ impl App {
         }
     }
 
+    /// Pick which window of an app to activate: the one the user most recently
+    /// used (per `window_mru`), falling back to the top of the current Z-order.
+    /// The fallback prefers a non-minimized window over the app's oldest one.
+    fn pick_app_window(&self, hwnds: &[(HWND, String)]) -> HWND {
+        if let Some(hwnd) = self.window_mru.iter().find_map(|id| {
+            hwnds
+                .iter()
+                .find(|(h, _)| h.0 as isize == *id)
+                .map(|(h, _)| *h)
+        }) {
+            return hwnd;
+        }
+        if is_iconic_window(hwnds[0].0) {
+            if let Some((h, _)) = hwnds.iter().find(|(h, _)| !is_iconic_window(*h)) {
+                return *h;
+            }
+        }
+        hwnds[0].0
+    }
+
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
             self.original_foreground_hwnd = None;
@@ -544,6 +583,11 @@ impl App {
                 self.app_mru.insert(0, key.clone());
             }
             if let Some((_, id)) = state.apps.get(state.index) {
+                // Remember this as the app's most-recently-used window so a later
+                // switch back to it restores this window, not the oldest one.
+                let wid = id.0 as isize;
+                self.window_mru.retain(|x| *x != wid);
+                self.window_mru.insert(0, wid);
                 set_foreground_window(*id);
             }
             self.painter.unpaint(state);
