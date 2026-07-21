@@ -1,8 +1,8 @@
-use crate::utils::is_process_elevated;
+use crate::utils::{is_process_elevated, HandleWrapper};
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
-use std::{ffi::c_void, mem::size_of, path::PathBuf};
+use std::{collections::HashMap, ffi::c_void, mem::size_of, path::PathBuf};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, MAX_PATH, POINT, RECT},
@@ -123,12 +123,15 @@ pub fn get_window_pid(hwnd: HWND) -> u32 {
 }
 
 pub fn get_module_path(pid: u32) -> Option<String> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    // Wrap the handle so it is always closed; otherwise every call (one per
+    // window on each switch, plus every foreground change) leaks a handle.
+    let handle =
+        HandleWrapper::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
     let mut len: u32 = MAX_PATH;
     let mut name = vec![0u16; len as usize];
     let ret = unsafe {
         QueryFullProcessImageNameW(
-            handle,
+            handle.get_handle(),
             PROCESS_NAME_WIN32,
             PWSTR(name.as_mut_ptr()),
             &mut len,
@@ -439,7 +442,6 @@ pub fn list_windows(
     unsafe { EnumWindows(Some(enum_window), LPARAM(&mut hwnds as *mut _ as isize)) }
         .map_err(|e| anyhow!("Fail to get windows {}", e))?;
     let mut valid_hwnds = vec![];
-    let mut owner_hwnds = vec![];
     for hwnd in hwnds.iter().cloned() {
         let (is_visible, is_iconic, is_tool, is_topmost) = get_window_state(hwnd);
         let ok = is_visible
@@ -454,20 +456,41 @@ pub fn list_windows(
                 valid_hwnds.push((hwnd, title));
             }
         }
-        owner_hwnds.push(get_owner_window(hwnd))
     }
+
+    // A process keeps the same image path and elevation for its whole life, so
+    // resolve each PID at most once per call rather than once per window (a
+    // browser with many windows would otherwise open its process many times).
+    let mut module_paths: HashMap<u32, String> = HashMap::new();
+    let mut elevated: HashMap<u32, bool> = HashMap::new();
+    // The owner map is only needed to recover the real process behind windows
+    // hosted by ApplicationFrameHost (UWP apps). Build it lazily, and only once,
+    // so the common case avoids an extra GetWindow call per top-level window.
+    let mut owner_hwnds: Option<Vec<HWND>> = None;
+
     for (hwnd, title) in valid_hwnds.into_iter() {
         let mut pid = get_window_pid(hwnd);
-        let mut module_path = get_module_path(pid).unwrap_or_default();
+        let mut module_path = module_paths
+            .entry(pid)
+            .or_insert_with(|| get_module_path(pid).unwrap_or_default())
+            .clone();
         if !is_valid_module_path(&module_path) {
-            if let Some((i, _)) = owner_hwnds.iter().enumerate().find(|(_, v)| **v == hwnd) {
+            let owners = owner_hwnds
+                .get_or_insert_with(|| hwnds.iter().map(|h| get_owner_window(*h)).collect());
+            if let Some((i, _)) = owners.iter().enumerate().find(|(_, v)| **v == hwnd) {
                 pid = get_window_pid(hwnds[i]);
-                module_path = get_module_path(pid).unwrap_or_default();
+                module_path = module_paths
+                    .entry(pid)
+                    .or_insert_with(|| get_module_path(pid).unwrap_or_default())
+                    .clone();
             }
         }
         if is_valid_module_path(&module_path) {
             if !is_admin {
-                if let Some(true) = is_process_elevated(pid) {
+                let is_elevated = *elevated
+                    .entry(pid)
+                    .or_insert_with(|| is_process_elevated(pid).unwrap_or(false));
+                if is_elevated {
                     continue;
                 }
             }
