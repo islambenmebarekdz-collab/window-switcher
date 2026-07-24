@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::LazyLock;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
@@ -24,10 +25,11 @@ use windows::Win32::{
 };
 
 static KEYBOARD_STATE: LazyLock<Mutex<Vec<HotKeyState>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-static mut WINDOW: HWND = HWND(0 as _);
-static mut IS_SHIFT_PRESSED: bool = false;
-static mut IS_SWITCHING_APPS: bool = false;
-static mut PREVIOUS_KEYCODE: u32 = 0;
+/// Target window handle (as isize) that hotkey messages are posted to.
+static WINDOW: AtomicIsize = AtomicIsize::new(0);
+static IS_SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static IS_SWITCHING_APPS: AtomicBool = AtomicBool::new(false);
+static PREVIOUS_KEYCODE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Debug)]
 pub struct KeyboardListener {
@@ -36,7 +38,7 @@ pub struct KeyboardListener {
 
 impl KeyboardListener {
     pub fn init(hwnd: HWND, hotkeys: &[&Hotkey]) -> Result<Self> {
-        unsafe { WINDOW = hwnd }
+        WINDOW.store(hwnd.0 as isize, Ordering::Relaxed);
 
         let keyboard_state = hotkeys
             .iter()
@@ -99,7 +101,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     let scan_code = kbd_data.scanCode;
     let is_key_pressed = || kbd_data.flags.0 & LLKHF_UP.0 == 0;
     if [SCANCODE_LSHIFT, SCANCODE_RSHIFT].contains(&scan_code) {
-        IS_SHIFT_PRESSED = is_key_pressed();
+        IS_SHIFT_PRESSED.store(is_key_pressed(), Ordering::Relaxed);
     }
     let mut keyboard_state = KEYBOARD_STATE.lock();
     let mut send_done_hotkeys: IndexSet<u32> = IndexSet::new();
@@ -112,7 +114,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
                 state.is_modifier_pressed = true;
             } else {
                 state.is_modifier_pressed = false;
-                if PREVIOUS_KEYCODE == state.hotkey.code {
+                if PREVIOUS_KEYCODE.load(Ordering::Relaxed) == state.hotkey.code {
                     send_done_hotkeys.insert(state.hotkey.id);
                 }
             }
@@ -123,21 +125,28 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
             if is_key_pressed() && state.is_modifier_pressed {
                 let id = state.hotkey.id;
                 if scan_code == state.hotkey.code {
-                    let reverse = if IS_SHIFT_PRESSED { 1 } else { 0 };
+                    let reverse = if IS_SHIFT_PRESSED.load(Ordering::Relaxed) {
+                        1
+                    } else {
+                        0
+                    };
                     if id == SWITCH_APPS_HOTKEY_ID
-                        || (id == SWITCH_WINDOWS_HOTKEY_ID && !IS_FOREGROUND_IN_BLACKLIST)
+                        || (id == SWITCH_WINDOWS_HOTKEY_ID
+                            && !IS_FOREGROUND_IN_BLACKLIST.load(Ordering::Relaxed))
                     {
                         send_action_message = Some((id, reverse, false));
-                        PREVIOUS_KEYCODE = scan_code;
+                        PREVIOUS_KEYCODE.store(scan_code, Ordering::Relaxed);
                         break;
                     };
                 } else if id == SWITCH_APPS_HOTKEY_ID {
                     if scan_code == 0x01 {
                         // escape key
                         send_action_message = Some((id, 0, true));
-                        PREVIOUS_KEYCODE = scan_code;
+                        PREVIOUS_KEYCODE.store(scan_code, Ordering::Relaxed);
                         break;
-                    } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code) && IS_SWITCHING_APPS {
+                    } else if [0x48, 0x4b, 0x4d, 0x50].contains(&scan_code)
+                        && IS_SWITCHING_APPS.load(Ordering::Relaxed)
+                    {
                         // arrow keys
                         let reverse = if scan_code == 0x48 || scan_code == 0x4b {
                             1
@@ -153,28 +162,30 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
     }
     drop(keyboard_state);
 
+    let window = HWND(WINDOW.load(Ordering::Relaxed) as _);
+
     for id in send_done_hotkeys {
         if id == SWITCH_APPS_HOTKEY_ID {
-            send_message_timeout(WINDOW, WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0));
-            IS_SWITCHING_APPS = false;
+            send_message_timeout(window, WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0));
+            IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
-            send_message_timeout(WINDOW, WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0));
+            send_message_timeout(window, WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0));
         }
     }
 
     if let Some((id, reverse, is_cancel)) = send_action_message {
         if id == SWITCH_APPS_HOTKEY_ID {
             if is_cancel {
-                send_message_timeout(WINDOW, WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0));
-                IS_SWITCHING_APPS = false;
+                send_message_timeout(window, WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0));
+                IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
             } else {
-                send_message_timeout(WINDOW, WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse));
-                IS_SWITCHING_APPS = true;
+                send_message_timeout(window, WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse));
+                IS_SWITCHING_APPS.store(true, Ordering::Relaxed);
             }
             return LRESULT(1);
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
-            send_message_timeout(WINDOW, WM_USER_SWITCH_WINDOWS, WPARAM(0), LPARAM(reverse));
-            IS_SWITCHING_APPS = false;
+            send_message_timeout(window, WM_USER_SWITCH_WINDOWS, WPARAM(0), LPARAM(reverse));
+            IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
             return LRESULT(1);
         }
     }

@@ -1,7 +1,9 @@
 use crate::utils::get_window_exe;
 use anyhow::{bail, Result};
-use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 use windows::Win32::{
     Foundation::HWND,
     UI::{
@@ -12,9 +14,12 @@ use windows::Win32::{
     },
 };
 
-pub static mut IS_FOREGROUND_IN_BLACKLIST: bool = false;
+pub static IS_FOREGROUND_IN_BLACKLIST: AtomicBool = AtomicBool::new(false);
 
-static BLACKLIST: OnceCell<HashSet<String>> = OnceCell::new();
+/// The lowercased executable blacklist. Held behind an RwLock (not a
+/// write-once cell) so reloading the config can replace it at runtime.
+static BLACKLIST: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 #[derive(Debug)]
 pub struct ForegroundWatcher {
@@ -23,13 +28,16 @@ pub struct ForegroundWatcher {
 
 impl ForegroundWatcher {
     pub fn init(blacklist: &HashSet<String>) -> Result<Self> {
+        // Always refresh the shared blacklist and reset the cached flag so a
+        // reload that changes or clears the blacklist takes effect immediately.
+        *BLACKLIST.write() = blacklist.iter().map(|v| v.to_lowercase()).collect();
+        IS_FOREGROUND_IN_BLACKLIST.store(false, Ordering::Relaxed);
+
         if blacklist.is_empty() {
             return Ok(Self {
                 hook: HWINEVENTHOOK::default(),
             });
         }
-
-        let _ = BLACKLIST.set(blacklist.iter().map(|v| v.to_lowercase()).collect());
 
         let hook = unsafe {
             SetWinEventHook(
@@ -76,7 +84,7 @@ unsafe extern "system" fn win_event_proc(
         Some(v) => v.to_lowercase(),
         None => return,
     };
-    let is_in_blacklist = BLACKLIST.get().unwrap().contains(&exe);
-    IS_FOREGROUND_IN_BLACKLIST = is_in_blacklist;
+    let is_in_blacklist = BLACKLIST.read().contains(&exe);
+    IS_FOREGROUND_IN_BLACKLIST.store(is_in_blacklist, Ordering::Relaxed);
     debug!("foreground {exe} {is_in_blacklist}");
 }

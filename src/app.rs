@@ -1,5 +1,6 @@
-use crate::config::{edit_config_file, Config};
+use crate::config::{edit_config_file, load_config, Config};
 use crate::foreground::ForegroundWatcher;
+use crate::mru;
 use crate::keyboard::KeyboardListener;
 use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
@@ -12,6 +13,7 @@ use crate::utils::{
 use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
@@ -45,7 +47,7 @@ pub fn start(config: &Config) -> Result<()> {
 }
 
 /// Listen to this message to recreate the tray icon since the taskbar has been recreated.
-static mut WM_TASKBARCREATED: u32 = 0;
+static WM_TASKBARCREATED: AtomicU32 = AtomicU32::new(0);
 
 pub struct App {
     hwnd: HWND,
@@ -139,7 +141,10 @@ impl App {
     }
 
     fn create_window() -> Result<HWND> {
-        unsafe { WM_TASKBARCREATED = RegisterWindowMessageW(w!("TaskbarCreated")) };
+        WM_TASKBARCREATED.store(
+            unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            Ordering::Relaxed,
+        );
 
         let hinstance = unsafe { GetModuleHandleW(None) }
             .map_err(|err| anyhow!("Failed to get current module handle, {err}"))?;
@@ -208,6 +213,37 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Re-read the config file and re-apply any settings that affect running
+    /// behaviour, without restarting. Called after the user edits the config.
+    fn reload_config(&mut self) {
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(err) => {
+                alert!("{err}");
+                return;
+            }
+        };
+        if config == self.config {
+            return;
+        }
+        self.config = config;
+
+        // Reinstall the hooks whose behaviour depends on the config: the
+        // hotkeys and the foreground blacklist. Other settings (icon overrides,
+        // ignore_minimal, current-desktop) are read from `self.config` on each
+        // switch, so replacing it above is enough for them.
+        self.keyboard_listener = None;
+        match KeyboardListener::init(self.hwnd, &self.config.to_hotkeys()) {
+            Ok(listener) => self.keyboard_listener = Some(listener),
+            Err(err) => alert!("Failed to apply hotkeys: {err}"),
+        }
+        self.foreground_watcher = None;
+        if let Ok(watcher) = ForegroundWatcher::init(&self.config.switch_windows_blacklist) {
+            self.foreground_watcher = Some(watcher);
+        }
+        info!("config reloaded");
     }
 
     unsafe extern "system" fn window_proc(
@@ -298,11 +334,14 @@ impl App {
                             let app = get_app(hwnd)?;
                             app.startup.toggle()?;
                         }
-                        IDM_CONFIGURE => {
-                            if let Err(err) = edit_config_file() {
-                                alert!("{err}");
+                        IDM_CONFIGURE => match edit_config_file() {
+                            Ok(_) => {
+                                if let Ok(app) = get_app(hwnd) {
+                                    app.reload_config();
+                                }
                             }
-                        }
+                            Err(err) => alert!("{err}"),
+                        },
                         _ => {}
                     }
                 }
@@ -330,7 +369,9 @@ impl App {
             WM_ERASEBKGND => {
                 return Ok(LRESULT(0));
             }
-            _ if msg == WM_USER_REGISTER_TRAYICON || unsafe { msg == WM_TASKBARCREATED } => {
+            _ if msg == WM_USER_REGISTER_TRAYICON
+                || msg == WM_TASKBARCREATED.load(Ordering::Relaxed) =>
+            {
                 let app = get_app(hwnd)?;
                 app.set_trayicon();
             }
@@ -415,6 +456,10 @@ impl App {
                     cache: Some((module_path.clone(), state_id, index, state_windows)),
                     modifier_released: false,
                 };
+                // Record the window we just activated as the app's most-recent
+                // one immediately, so switching away and back restores it without
+                // waiting for the next switch-apps session to observe the focus.
+                mru::promote(&mut self.window_mru, hwnd.0 as isize);
                 set_foreground_window(hwnd);
 
                 Ok(true)
@@ -476,20 +521,24 @@ impl App {
             .find(|(_, hwnds)| hwnds.iter().any(|(id, _)| *id == foreground))
             .map(|(key, _)| key.clone());
         if let Some(key) = foreground_key {
-            self.app_mru.retain(|k| k != &key);
-            self.app_mru.insert(0, key);
+            mru::promote(&mut self.app_mru, key);
         }
-        let mut ordered: Vec<String> = self
-            .app_mru
-            .iter()
-            .filter(|k| windows.contains_key(*k))
-            .cloned()
-            .collect();
-        for key in windows.keys() {
-            if !ordered.iter().any(|k| k == key) {
-                ordered.push(key.clone());
+        let present_keys: Vec<String> = windows.keys().cloned().collect();
+
+        // Release cached icons for apps that have since closed, so a long-running
+        // session does not accumulate icon handles for apps that are long gone.
+        self.cached_icons.retain(|key, icon| {
+            if present_keys.contains(key) {
+                true
+            } else {
+                unsafe {
+                    let _ = DestroyIcon(*icon);
+                }
+                false
             }
-        }
+        });
+
+        let ordered = mru::order_by_mru(&self.app_mru, &present_keys);
         // Persist the freshly computed order (also prunes closed apps).
         self.app_mru = ordered.clone();
 
@@ -498,15 +547,13 @@ impl App {
         // and on commit, never on intermediate hops, so our own per-hop
         // activations cannot make it forget the window you last used.
         let foreground_id = foreground.0 as isize;
-        let all_window_ids: std::collections::HashSet<isize> = windows
+        let all_window_ids: Vec<isize> = windows
             .values()
             .flat_map(|hwnds| hwnds.iter().map(|(h, _)| h.0 as isize))
             .collect();
-        // Drop the foreground (to re-add it at the front) and any closed windows.
-        self.window_mru
-            .retain(|id| *id != foreground_id && all_window_ids.contains(id));
+        mru::retain_present(&mut self.window_mru, &all_window_ids);
         if all_window_ids.contains(&foreground_id) {
-            self.window_mru.insert(0, foreground_id);
+            mru::promote(&mut self.window_mru, foreground_id);
         }
 
         let mut apps = vec![];
@@ -558,13 +605,9 @@ impl App {
     /// used (per `window_mru`), falling back to the top of the current Z-order.
     /// The fallback prefers a non-minimized window over the app's oldest one.
     fn pick_app_window(&self, hwnds: &[(HWND, String)]) -> HWND {
-        if let Some(hwnd) = self.window_mru.iter().find_map(|id| {
-            hwnds
-                .iter()
-                .find(|(h, _)| h.0 as isize == *id)
-                .map(|(h, _)| *h)
-        }) {
-            return hwnd;
+        let ids: Vec<isize> = hwnds.iter().map(|(h, _)| h.0 as isize).collect();
+        if let Some(i) = mru::most_recent_index(&self.window_mru, &ids) {
+            return hwnds[i].0;
         }
         if is_iconic_window(hwnds[0].0) {
             if let Some((h, _)) = hwnds.iter().find(|(h, _)| !is_iconic_window(*h)) {
@@ -579,15 +622,12 @@ impl App {
             self.original_foreground_hwnd = None;
             // The committed app is now the most-recently-used one.
             if let Some(key) = state.keys.get(state.index) {
-                self.app_mru.retain(|k| k != key);
-                self.app_mru.insert(0, key.clone());
+                mru::promote(&mut self.app_mru, key.clone());
             }
             if let Some((_, id)) = state.apps.get(state.index) {
                 // Remember this as the app's most-recently-used window so a later
                 // switch back to it restores this window, not the oldest one.
-                let wid = id.0 as isize;
-                self.window_mru.retain(|x| *x != wid);
-                self.window_mru.insert(0, wid);
+                mru::promote(&mut self.window_mru, id.0 as isize);
                 set_foreground_window(*id);
             }
             self.painter.unpaint(state);

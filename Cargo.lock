@@ -454,7 +454,6 @@ dependencies = [
  "embed-resource",
  "indexmap",
  "log",
- "once_cell",
  "parking_lot",
  "rust-ini",
  "simple-logging",
