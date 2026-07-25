@@ -125,8 +125,9 @@ pub fn get_window_pid(hwnd: HWND) -> u32 {
 pub fn get_module_path(pid: u32) -> Option<String> {
     // Wrap the handle so it is always closed; otherwise every call (one per
     // window on each switch, plus every foreground change) leaks a handle.
-    let handle =
-        HandleWrapper::new(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    let handle = HandleWrapper::new(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?,
+    );
     let mut len: u32 = MAX_PATH;
     let mut name = vec![0u16; len as usize];
     let ret = unsafe {

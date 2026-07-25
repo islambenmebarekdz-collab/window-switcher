@@ -1,7 +1,7 @@
 use crate::config::{edit_config_file, load_config, Config};
 use crate::foreground::ForegroundWatcher;
-use crate::mru;
 use crate::keyboard::KeyboardListener;
+use crate::mru;
 use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
@@ -348,18 +348,24 @@ impl App {
             }
             WM_POWERBROADCAST => {
                 let event = wparam.0 as u32;
-                if event == 0x0012 || event == 0x0007 { // PBT_APMRESUMEAUTOMATIC or PBT_APMRESUMESUSPEND
-                    debug!("System resume from sleep/standby detected. Re-installing keyboard hook...");
+                if event == 0x0012 || event == 0x0007 {
+                    // PBT_APMRESUMEAUTOMATIC or PBT_APMRESUMESUSPEND
+                    debug!(
+                        "System resume from sleep/standby detected. Re-installing keyboard hook..."
+                    );
                     if let Ok(app) = get_app(hwnd) {
                         // Drop old listener and watcher first
                         app.keyboard_listener = None;
                         app.foreground_watcher = None;
                         // Re-create new listener and watcher
-                        if let Ok(listener) = KeyboardListener::init(hwnd, &app.config.to_hotkeys()) {
+                        if let Ok(listener) = KeyboardListener::init(hwnd, &app.config.to_hotkeys())
+                        {
                             app.keyboard_listener = Some(listener);
                             info!("Keyboard hook re-installed successfully after resume.");
                         }
-                        if let Ok(watcher) = ForegroundWatcher::init(&app.config.switch_windows_blacklist) {
+                        if let Ok(watcher) =
+                            ForegroundWatcher::init(&app.config.switch_windows_blacklist)
+                        {
                             app.foreground_watcher = Some(watcher);
                             info!("Foreground watcher re-installed successfully after resume.");
                         }
@@ -561,12 +567,9 @@ impl App {
         for key in ordered {
             let hwnds = &windows[&key];
             let module_hwnd = self.pick_app_window(hwnds);
-            let module_hicon = *self
-                .cached_icons
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    get_app_icon(&self.config.switch_apps_override_icons, &key, module_hwnd)
-                });
+            let module_hicon = *self.cached_icons.entry(key.clone()).or_insert_with(|| {
+                get_app_icon(&self.config.switch_apps_override_icons, &key, module_hwnd)
+            });
             apps.push((module_hicon, module_hwnd));
             keys.push(key);
         }

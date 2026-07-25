@@ -18,8 +18,7 @@ pub static IS_FOREGROUND_IN_BLACKLIST: AtomicBool = AtomicBool::new(false);
 
 /// The lowercased executable blacklist. Held behind an RwLock (not a
 /// write-once cell) so reloading the config can replace it at runtime.
-static BLACKLIST: LazyLock<RwLock<HashSet<String>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
+static BLACKLIST: LazyLock<RwLock<HashSet<String>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
 
 #[derive(Debug)]
 pub struct ForegroundWatcher {

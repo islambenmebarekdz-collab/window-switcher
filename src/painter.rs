@@ -24,8 +24,8 @@ use windows::Win32::{
     UI::{
         HiDpi::GetDpiForWindow,
         WindowsAndMessaging::{
-            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow,
-            DI_NORMAL, SW_HIDE, SW_SHOW, ULW_ALPHA,
+            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow, DI_NORMAL, SW_HIDE, SW_SHOW,
+            ULW_ALPHA,
         },
     },
 };
