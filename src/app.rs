@@ -6,8 +6,9 @@ use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
-    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
-    is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
+    announce, check_error, get_app_icon, get_foreground_window, get_window_user_data,
+    is_iconic_window, is_running_as_admin, list_windows, minimize_window, set_foreground_window,
+    set_window_user_data,
 };
 
 use anyhow::{anyhow, Result};
@@ -67,6 +68,10 @@ pub struct App {
     /// used rather than the oldest one. Like `app_mru`, it is updated only on
     /// genuine focus captures and commits, never on intermediate hops.
     window_mru: Vec<isize>,
+    /// Windows that were minimized and which we restored purely to preview them
+    /// while cycling. Any that the user does not settle on are minimized again,
+    /// so tabbing past a minimized app no longer un-minimizes it for good.
+    restored_windows: Vec<isize>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
     original_foreground_hwnd: Option<HWND>,
@@ -105,6 +110,7 @@ impl App {
             switch_apps_state: None,
             app_mru: Vec::new(),
             window_mru: Vec::new(),
+            restored_windows: Vec::new(),
             cached_icons: Default::default(),
             painter,
             original_foreground_hwnd: None,
@@ -484,6 +490,9 @@ impl App {
             self.original_foreground_hwnd = Some(get_foreground_window());
         }
 
+        // Read before borrowing the state mutably below.
+        let announce = self.config.switch_apps_announce;
+
         if let Some(state) = self.switch_apps_state.as_mut() {
             if reverse {
                 if state.index == 0 {
@@ -501,8 +510,10 @@ impl App {
             // Actually activate the candidate window on every hop. The OS then
             // emits genuine focus events, so screen readers (NVDA, Narrator...)
             // announce the switch naturally - no synthetic events needed.
-            if let Some((_, target_hwnd)) = state.apps.get(state.index) {
-                set_foreground_window(*target_hwnd);
+            let target = state.apps.get(state.index).map(|(_, h)| *h);
+            let announcement = Self::announcement_for(state, announce);
+            if let Some(hwnd) = target {
+                self.activate_candidate(hwnd, announcement);
             }
             return Ok(());
         }
@@ -564,14 +575,21 @@ impl App {
 
         let mut apps = vec![];
         let mut keys = vec![];
+        let mut names = vec![];
         for key in ordered {
             let hwnds = &windows[&key];
             let module_hwnd = self.pick_app_window(hwnds);
             let module_hicon = *self.cached_icons.entry(key.clone()).or_insert_with(|| {
                 get_app_icon(&self.config.switch_apps_override_icons, &key, module_hwnd)
             });
+            let name = hwnds
+                .iter()
+                .find(|(h, _)| *h == module_hwnd)
+                .map(|(_, title)| title.clone())
+                .unwrap_or_default();
             apps.push((module_hicon, module_hwnd));
             keys.push(key);
+            names.push(name);
         }
 
         let index = if apps.len() == 1 {
@@ -582,15 +600,21 @@ impl App {
             1
         };
 
-        let state = SwitchAppsState { apps, keys, index };
+        let state = SwitchAppsState {
+            apps,
+            keys,
+            names,
+            index,
+        };
 
         // Actually activate the first candidate so screen readers announce it
         // naturally through the genuine focus change.
-        if let Some((_, target_hwnd)) = state.apps.get(state.index) {
-            set_foreground_window(*target_hwnd);
-        }
-
+        let target = state.apps.get(state.index).map(|(_, h)| *h);
+        let announcement = Self::announcement_for(&state, announce);
         self.switch_apps_state = Some(state);
+        if let Some(hwnd) = target {
+            self.activate_candidate(hwnd, announcement);
+        }
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())
     }
@@ -600,6 +624,44 @@ impl App {
             if let Some(i) = self.painter.find_clicked_app_index(state) {
                 state.index = i;
                 self.do_switch_app();
+            }
+        }
+    }
+
+    /// Build the text a screen reader should speak for the current selection,
+    /// or `None` when announcements are turned off.
+    fn announcement_for(state: &SwitchAppsState, enabled: bool) -> Option<String> {
+        if !enabled {
+            return None;
+        }
+        let name = state.names.get(state.index)?;
+        Some(format!(
+            "{name}, {} of {}",
+            state.index + 1,
+            state.apps.len()
+        ))
+    }
+
+    /// Activate a window while cycling, remembering it if we had to un-minimize
+    /// it so it can be put back should the user move on, and optionally telling
+    /// the screen reader where the selection now is.
+    fn activate_candidate(&mut self, hwnd: HWND, announcement: Option<String>) {
+        if set_foreground_window(hwnd) {
+            let id = hwnd.0 as isize;
+            if !self.restored_windows.contains(&id) {
+                self.restored_windows.push(id);
+            }
+        }
+        if let Some(text) = announcement {
+            announce(self.hwnd, &text);
+        }
+    }
+
+    /// Re-minimize every window we restored just to preview it, except `keep`.
+    fn undo_previews(&mut self, keep: Option<isize>) {
+        for id in std::mem::take(&mut self.restored_windows) {
+            if Some(id) != keep {
+                minimize_window(HWND(id as _));
             }
         }
     }
@@ -627,11 +689,15 @@ impl App {
             if let Some(key) = state.keys.get(state.index) {
                 mru::promote(&mut self.app_mru, key.clone());
             }
-            if let Some((_, id)) = state.apps.get(state.index) {
+            let chosen = state.apps.get(state.index).map(|(_, id)| *id);
+            // Put back every window we un-minimized just to preview it, keeping
+            // only the one the user settled on.
+            self.undo_previews(chosen.map(|h| h.0 as isize));
+            if let Some(id) = chosen {
                 // Remember this as the app's most-recently-used window so a later
                 // switch back to it restores this window, not the oldest one.
                 mru::promote(&mut self.window_mru, id.0 as isize);
-                set_foreground_window(*id);
+                set_foreground_window(id);
             }
             self.painter.unpaint(state);
         }
@@ -641,12 +707,23 @@ impl App {
         if let Some(state) = self.switch_apps_state.take() {
             // On explicit cancel (ESC), take the user back where they started;
             // the resulting genuine focus event makes screen readers announce it.
+            // Nothing was chosen, so every previewed window goes back to the
+            // taskbar - except the one we are returning to.
+            let orig = self.original_foreground_hwnd.take();
+            // Keep whichever window the user ends up on: the original when they
+            // cancelled, or the one switch-windows just activated when it took
+            // over the session.
+            let keep = if restore_original {
+                orig
+            } else {
+                Some(get_foreground_window())
+            };
+            self.undo_previews(keep.map(|h| h.0 as isize));
             if restore_original {
-                if let Some(orig) = self.original_foreground_hwnd.take() {
+                if let Some(orig) = orig {
                     set_foreground_window(orig);
                 }
             }
-            self.original_foreground_hwnd = None;
             self.painter.unpaint(state);
         }
     }
@@ -682,5 +759,7 @@ pub struct SwitchAppsState {
     pub apps: Vec<(HICON, HWND)>,
     /// App key parallel to `apps`, used to maintain the MRU order.
     pub keys: Vec<String>,
+    /// Window title parallel to `apps`, spoken when announcements are enabled.
+    pub names: Vec<String>,
     pub index: usize,
 }

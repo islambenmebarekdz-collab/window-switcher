@@ -26,6 +26,11 @@ pub struct Config {
     pub switch_apps_hotkey: Vec<Hotkey>,
     pub switch_apps_ignore_minimal: bool,
     pub switch_apps_override_icons: IndexMap<String, String>,
+    /// Speak the selected app through the screen reader while cycling. Off by
+    /// default: activating each window already makes screen readers announce
+    /// it, so this would be a second utterance. Turn it on to also hear the
+    /// position in the list ("Firefox, 3 of 7").
+    pub switch_apps_announce: bool,
     switch_apps_only_current_desktop: Option<bool>,
 }
 
@@ -53,6 +58,7 @@ impl Default for Config {
             .unwrap()],
             switch_apps_ignore_minimal: false,
             switch_apps_override_icons: Default::default(),
+            switch_apps_announce: false,
             switch_apps_only_current_desktop: None,
         }
     }
@@ -120,6 +126,9 @@ impl Config {
             }
             if let Some(v) = section.get("ignore_minimal").and_then(Config::to_bool) {
                 conf.switch_apps_ignore_minimal = v;
+            }
+            if let Some(v) = section.get("announce").and_then(Config::to_bool) {
+                conf.switch_apps_announce = v;
             }
             if let Some(v) = section.get("override_icons").map(normalize_path_value) {
                 conf.switch_apps_override_icons = v

@@ -3,7 +3,7 @@ use crate::utils::{is_process_elevated, HandleWrapper};
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use std::{collections::HashMap, ffi::c_void, mem::size_of, path::PathBuf};
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::core::{BOOL, BSTR, PCWSTR, PWSTR};
 use windows::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, MAX_PATH, POINT, RECT},
     Graphics::{
@@ -22,13 +22,18 @@ use windows::Win32::{
         },
     },
     UI::{
+        Accessibility::{
+            NotificationKind_Other, NotificationProcessing_MostRecent, UiaHostProviderFromHwnd,
+            UiaRaiseNotificationEvent,
+        },
         Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_MOUSE},
         Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow},
         WindowsAndMessaging::{
             EnumWindows, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
             GetWindowPlacement, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
             SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA, GW_OWNER,
-            SW_RESTORE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_ICONIC, WS_VISIBLE,
+            SW_RESTORE, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            WS_ICONIC, WS_VISIBLE,
         },
     },
 };
@@ -374,10 +379,15 @@ pub fn get_window_exe(hwnd: HWND) -> Option<String> {
     module_path.split('\\').map(|v| v.to_string()).next_back()
 }
 
-pub fn set_foreground_window(hwnd: HWND) {
+/// Activate `hwnd`, restoring it first if it is minimized.
+///
+/// Returns whether the window had to be restored, so callers that activate
+/// windows speculatively (while cycling) can put them back afterwards.
+pub fn set_foreground_window(hwnd: HWND) -> bool {
     // ref https://github.com/microsoft/PowerToys/blob/4cb72ee126caf1f720c507f6a1dbe658cd515366/src/modules/fancyzones/FancyZonesLib/WindowUtils.cpp#L191
     unsafe {
-        if is_iconic_window(hwnd) {
+        let was_iconic = is_iconic_window(hwnd);
+        if was_iconic {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
 
@@ -389,7 +399,46 @@ pub fn set_foreground_window(hwnd: HWND) {
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
         let _ = SetForegroundWindow(hwnd);
-    };
+
+        was_iconic
+    }
+}
+
+/// Minimize `hwnd` without activating it or any other window. Used to undo a
+/// restore that only happened so a window could be previewed while cycling.
+pub fn minimize_window(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+    }
+}
+
+/// Ask the screen reader to speak `text`.
+///
+/// Uses the UI Automation notification event, which is the sanctioned way to
+/// surface transient information (NVDA, Narrator and JAWS all listen for it).
+/// `UiaHostProviderFromHwnd` gives us the default provider for our own window,
+/// so no custom UI Automation provider has to be implemented.
+pub fn announce(hwnd: HWND, text: &str) {
+    unsafe {
+        let provider = match UiaHostProviderFromHwnd(hwnd) {
+            Ok(provider) => provider,
+            Err(err) => {
+                debug!("announce: no UIA provider, {err}");
+                return;
+            }
+        };
+        // A stable activity id lets the screen reader coalesce rapid updates
+        // while cycling instead of queueing every intermediate hop.
+        if let Err(err) = UiaRaiseNotificationEvent(
+            &provider,
+            NotificationKind_Other,
+            NotificationProcessing_MostRecent,
+            &BSTR::from(text),
+            &BSTR::from("WindowSwitcherSelection"),
+        ) {
+            debug!("announce: failed, {err}");
+        }
+    }
 }
 
 pub fn get_foreground_window() -> HWND {
