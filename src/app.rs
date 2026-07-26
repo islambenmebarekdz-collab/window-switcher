@@ -5,6 +5,7 @@ use crate::mru;
 use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
+use crate::uia::{raise_selection_events, ListProvider, Selection};
 use crate::utils::{
     announce, check_error, get_app_icon, get_foreground_window, get_window_user_data,
     is_iconic_window, is_running_as_admin, list_windows, minimize_window, set_foreground_window,
@@ -15,17 +16,18 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use windows::core::{w, PCWSTR};
+use windows::core::{w, ComObject, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
+    UI::Accessibility::{IRawElementProviderSimple, UiaReturnRawElementProvider, UiaRootObjectId},
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW,
         GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
         RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
         CW_USEDEFAULT, GWL_STYLE, HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
-        WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WM_ERASEBKGND, WM_GETOBJECT, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW,
+        WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     },
 };
 
@@ -73,6 +75,8 @@ pub struct App {
     /// so tabbing past a minimized app no longer un-minimizes it for good.
     restored_windows: Vec<isize>,
     cached_icons: HashMap<String, HICON>,
+    /// Describes the overlay to assistive technology as a list of windows.
+    uia: ComObject<ListProvider>,
     painter: GdiAAPainter,
     original_foreground_hwnd: Option<HWND>,
     keyboard_listener: Option<KeyboardListener>,
@@ -112,6 +116,7 @@ impl App {
             window_mru: Vec::new(),
             restored_windows: Vec::new(),
             cached_icons: Default::default(),
+            uia: ComObject::new(ListProvider::new(hwnd)),
             painter,
             original_foreground_hwnd: None,
             keyboard_listener: Some(keyboard_listener),
@@ -283,9 +288,16 @@ impl App {
                 debug!("message WM_USER_SWITCH_APPS");
                 let app = get_app(hwnd)?;
                 let reverse = lparam.0 == 1;
+                let opening = app.switch_apps_state.is_none();
                 app.switch_apps(reverse)?;
                 if let Some(state) = &app.switch_apps_state {
                     app.painter.paint(state);
+                }
+                if opening && app.config.switch_apps_accessible_list {
+                    // Now that the overlay is on screen it can take focus, so
+                    // the screen reader reads our list instead of the app that
+                    // happened to be in front.
+                    app.focus_overlay();
                 }
             }
             WM_USER_SWITCH_APPS_DONE => {
@@ -316,6 +328,17 @@ impl App {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
                 let app = get_app(hwnd)?;
                 app.switch_windows_state.modifier_released = true;
+            }
+            WM_GETOBJECT => {
+                // How assistive technology reaches our provider: UIA sends this
+                // with UiaRootObjectId and we hand back the list root.
+                if lparam.0 as i32 == UiaRootObjectId {
+                    let app = get_app(hwnd)?;
+                    let provider: IRawElementProviderSimple = app.uia.to_interface();
+                    return Ok(unsafe {
+                        UiaReturnRawElementProvider(hwnd, wparam, lparam, &provider)
+                    });
+                }
             }
             WM_NCHITTEST => {
                 return Ok(LRESULT(HTCLIENT as _));
@@ -492,6 +515,7 @@ impl App {
 
         // Read before borrowing the state mutably below.
         let announce = self.config.switch_apps_announce;
+        let accessible_list = self.config.switch_apps_accessible_list;
 
         if let Some(state) = self.switch_apps_state.as_mut() {
             if reverse {
@@ -512,7 +536,16 @@ impl App {
             // announce the switch naturally - no synthetic events needed.
             let target = state.apps.get(state.index).map(|(_, h)| *h);
             let announcement = Self::announcement_for(state, announce);
-            if let Some(hwnd) = target {
+            let index = state.index;
+            // Move the selection in the accessible list and tell assistive
+            // technology about it before anything else happens.
+            self.uia.set_selected_index(index);
+            raise_selection_events(&self.uia);
+            if accessible_list {
+                // The overlay itself holds focus in this mode, so the candidate
+                // is only activated once the user commits.
+                self.announce_only(announcement);
+            } else if let Some(hwnd) = target {
                 self.activate_candidate(hwnd, announcement);
             }
             return Ok(());
@@ -607,13 +640,32 @@ impl App {
             index,
         };
 
-        // Actually activate the first candidate so screen readers announce it
-        // naturally through the genuine focus change.
+        // Describe the whole list to assistive technology up front, so it can be
+        // explored (and, in accessible-list mode, announced) as a real list.
+        self.uia.set_selection(Selection {
+            names: state.names.clone(),
+            rects: self.painter.item_rects(state.apps.len()),
+            selected: state.index,
+        });
+
         let target = state.apps.get(state.index).map(|(_, h)| *h);
         let announcement = Self::announcement_for(&state, announce);
         self.switch_apps_state = Some(state);
-        if let Some(hwnd) = target {
-            self.activate_candidate(hwnd, announcement);
+
+        if accessible_list {
+            // Real Alt-Tab architecture: the overlay takes focus and the
+            // candidates are left alone until the user commits. Nothing is
+            // activated, restored or reordered while merely looking around.
+            // Focus is taken by the caller once the overlay is actually on
+            // screen, since a hidden window cannot become foreground.
+            self.announce_only(announcement);
+        } else {
+            // Actually activate the first candidate so screen readers announce
+            // it naturally through the genuine focus change.
+            raise_selection_events(&self.uia);
+            if let Some(hwnd) = target {
+                self.activate_candidate(hwnd, announcement);
+            }
         }
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())
@@ -657,6 +709,21 @@ impl App {
         }
     }
 
+    /// Give the overlay real keyboard focus and point assistive technology at
+    /// the selected item. Only used in accessible-list mode.
+    fn focus_overlay(&mut self) {
+        set_foreground_window(self.hwnd);
+        raise_selection_events(&self.uia);
+    }
+
+    /// Speak `announcement` without touching any window. Used in
+    /// accessible-list mode, where nothing is activated while cycling.
+    fn announce_only(&self, announcement: Option<String>) {
+        if let Some(text) = announcement {
+            announce(self.hwnd, &text);
+        }
+    }
+
     /// Re-minimize every window we restored just to preview it, except `keep`.
     fn undo_previews(&mut self, keep: Option<isize>) {
         for id in std::mem::take(&mut self.restored_windows) {
@@ -685,6 +752,8 @@ impl App {
     fn do_switch_app(&mut self) {
         if let Some(state) = self.switch_apps_state.take() {
             self.original_foreground_hwnd = None;
+            // The list is gone; stop advertising stale items.
+            self.uia.clear();
             // The committed app is now the most-recently-used one.
             if let Some(key) = state.keys.get(state.index) {
                 mru::promote(&mut self.app_mru, key.clone());
@@ -709,6 +778,7 @@ impl App {
             // the resulting genuine focus event makes screen readers announce it.
             // Nothing was chosen, so every previewed window goes back to the
             // taskbar - except the one we are returning to.
+            self.uia.clear();
             let orig = self.original_foreground_hwnd.take();
             // Keep whichever window the user ends up on: the original when they
             // cancelled, or the one switch-windows just activated when it took

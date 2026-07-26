@@ -12,6 +12,7 @@ mod mru;
 mod painter;
 mod startup;
 mod trayicon;
+mod uia;
 
 pub use crate::app::start;
 pub use crate::config::{load_config, Config};

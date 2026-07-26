@@ -217,6 +217,32 @@ impl GdiAAPainter {
         self.show = false;
     }
 
+    /// Screen rectangle of each item, in draw order. Used to give the UI
+    /// Automation provider real bounds so assistive tools can locate items.
+    pub fn item_rects(&self, num_apps: usize) -> Vec<RECT> {
+        let dpi_scale = get_dpi_scale(self.hwnd);
+        let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
+        let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+        let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
+
+        let Coordinate {
+            x, y, item_size, ..
+        } = Coordinate::new(num_apps as i32, icon_size_max, border_size, icon_border);
+
+        (0..num_apps as i32)
+            .map(|i| {
+                let left = x + border_size + item_size * i;
+                let top = y + border_size;
+                RECT {
+                    left,
+                    top,
+                    right: left + item_size,
+                    bottom: top + item_size,
+                }
+            })
+            .collect()
+    }
+
     pub fn find_clicked_app_index(&self, state: &SwitchAppsState) -> Option<usize> {
         let cursor_pos = unsafe {
             let mut pos = POINT::default();

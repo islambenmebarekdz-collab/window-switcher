@@ -12,6 +12,10 @@ rust-ini = "0.21.0"
 simple-logging = "2.0.2"
 xml = "1.3.0"
 
+# Required in scope by the `#[implement]` macro, which emits `windows_core::`
+# paths when generating the UI Automation providers in src/uia.rs.
+windows-core = "0.61"
+
 [dependencies.windows]
 version = "0.61.3"
 features = [
@@ -31,6 +35,7 @@ features = [
     "Win32_Storage_EnhancedStorage",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Com",
+    "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_LibraryLoader",
     "Win32_System_Registry",

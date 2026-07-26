@@ -31,6 +31,11 @@ pub struct Config {
     /// it, so this would be a second utterance. Turn it on to also hear the
     /// position in the list ("Firefox, 3 of 7").
     pub switch_apps_announce: bool,
+    /// Keep focus on the overlay while cycling instead of activating each
+    /// candidate, letting the UI Automation list drive screen-reader output.
+    /// This is how the built-in Alt-Tab behaves: nothing is activated,
+    /// restored or reordered until you actually commit to an app.
+    pub switch_apps_accessible_list: bool,
     switch_apps_only_current_desktop: Option<bool>,
 }
 
@@ -59,6 +64,7 @@ impl Default for Config {
             switch_apps_ignore_minimal: false,
             switch_apps_override_icons: Default::default(),
             switch_apps_announce: false,
+            switch_apps_accessible_list: false,
             switch_apps_only_current_desktop: None,
         }
     }
@@ -129,6 +135,9 @@ impl Config {
             }
             if let Some(v) = section.get("announce").and_then(Config::to_bool) {
                 conf.switch_apps_announce = v;
+            }
+            if let Some(v) = section.get("accessible_list").and_then(Config::to_bool) {
+                conf.switch_apps_accessible_list = v;
             }
             if let Some(v) = section.get("override_icons").map(normalize_path_value) {
                 conf.switch_apps_override_icons = v
