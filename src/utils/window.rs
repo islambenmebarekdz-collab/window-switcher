@@ -17,8 +17,8 @@ use windows::Win32::{
     System::{
         LibraryLoader::GetModuleFileNameW,
         Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-            PROCESS_QUERY_LIMITED_INFORMATION,
+            AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+            PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
     UI::{
@@ -29,11 +29,11 @@ use windows::Win32::{
         Input::KeyboardAndMouse::{SendInput, INPUT, INPUT_MOUSE},
         Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow},
         WindowsAndMessaging::{
-            EnumWindows, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
-            GetWindowPlacement, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-            SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA, GW_OWNER,
-            SW_RESTORE, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_ICONIC, WS_VISIBLE,
+            BringWindowToTop, EnumWindows, GetCursorPos, GetForegroundWindow, GetWindow,
+            GetWindowLongPtrW, GetWindowPlacement, GetWindowTextW, GetWindowThreadProcessId,
+            IsIconic, SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA,
+            GW_OWNER, SW_RESTORE, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST, WS_ICONIC, WS_VISIBLE,
         },
     },
 };
@@ -399,6 +399,30 @@ pub fn set_foreground_window(hwnd: HWND) -> bool {
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
         let _ = SetForegroundWindow(hwnd);
+
+        // Windows refuses foreground changes from a process that does not
+        // currently own the foreground, and the synthetic input above only
+        // sometimes buys that right. When it is refused the call still reports
+        // success, so the switcher would move its selection while the screen
+        // never changed - the user hears nothing and stays put. Check the
+        // result and, if it did not take, borrow the foreground thread's input
+        // queue, which lifts the restriction, and try once more.
+        if GetForegroundWindow() != hwnd {
+            let target = GetWindowThreadProcessId(hwnd, None);
+            let current = GetWindowThreadProcessId(GetForegroundWindow(), None);
+            let ours = GetCurrentThreadId();
+            if current != 0 && current != ours {
+                let _ = AttachThreadInput(ours, current, true);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = BringWindowToTop(hwnd);
+                let _ = AttachThreadInput(ours, current, false);
+            }
+            if GetForegroundWindow() != hwnd && target != 0 && target != ours {
+                let _ = AttachThreadInput(ours, target, true);
+                let _ = SetForegroundWindow(hwnd);
+                let _ = AttachThreadInput(ours, target, false);
+            }
+        }
 
         was_iconic
     }
