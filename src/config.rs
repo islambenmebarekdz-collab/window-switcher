@@ -26,15 +26,20 @@ pub struct Config {
     pub switch_apps_hotkey: Vec<Hotkey>,
     pub switch_apps_ignore_minimal: bool,
     pub switch_apps_override_icons: IndexMap<String, String>,
-    /// Speak the selected app through the screen reader while cycling. Off by
-    /// default: activating each window already makes screen readers announce
-    /// it, so this would be a second utterance. Turn it on to also hear the
-    /// position in the list ("Firefox, 3 of 7").
+    /// Speak the selected app and its position ("Firefox, 3 of 7") through the
+    /// screen reader while cycling. On by default, because in the default
+    /// preview-free mode nothing else says the selection out loud.
     pub switch_apps_announce: bool,
-    /// Keep focus on the overlay while cycling instead of activating each
-    /// candidate, letting the UI Automation list drive screen-reader output.
-    /// This is how the built-in Alt-Tab behaves: nothing is activated,
-    /// restored or reordered until you actually commit to an app.
+    /// Leave every window alone while cycling and only act on the app you
+    /// settle on, the way the macOS switcher works: the overlay itself holds
+    /// focus, the list is exposed through UI Automation, and no window is
+    /// activated, restored or reordered until you release the hotkey.
+    ///
+    /// Turning this off restores the old behaviour of activating each app as
+    /// you pass it, which is what made switching unreliable: Windows refuses
+    /// foreground changes from a process that does not own the foreground
+    /// (while still reporting success), and changing focus with Alt held makes
+    /// the app you land on open its menu bar and swallow the next keystrokes.
     pub switch_apps_accessible_list: bool,
     switch_apps_only_current_desktop: Option<bool>,
 }
@@ -63,8 +68,8 @@ impl Default for Config {
             .unwrap()],
             switch_apps_ignore_minimal: false,
             switch_apps_override_icons: Default::default(),
-            switch_apps_announce: false,
-            switch_apps_accessible_list: false,
+            switch_apps_announce: true,
+            switch_apps_accessible_list: true,
             switch_apps_only_current_desktop: None,
         }
     }
