@@ -31,9 +31,9 @@ use windows::Win32::{
         WindowsAndMessaging::{
             EnumWindows, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
             GetWindowPlacement, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-            SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GWL_USERDATA, GW_OWNER,
-            SW_RESTORE, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-            WS_ICONIC, WS_VISIBLE,
+            SetForegroundWindow, ShowWindow, SwitchToThisWindow, GWL_EXSTYLE, GWL_STYLE,
+            GWL_USERDATA, GW_OWNER, SW_RESTORE, SW_SHOWMINNOACTIVE, WINDOWPLACEMENT,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_ICONIC, WS_VISIBLE,
         },
     },
 };
@@ -407,6 +407,28 @@ pub fn set_foreground_window(hwnd: HWND) -> bool {
         // the following keystrokes. It made the switcher worse, not better.
 
         was_iconic
+    }
+}
+
+/// Settle on `hwnd` the way the shell's own Alt-Tab does.
+///
+/// `SetForegroundWindow` only brings a window to the front; whether the app
+/// then restores focus to whatever was focused inside it is up to the app, and
+/// several do not, which leaves a screen reader with nothing to read and the
+/// user pressing Tab to get moving. `SwitchToThisWindow` is the call the task
+/// switcher itself uses, and performs the full activation including that
+/// internal focus restoration, so use it whenever the user commits to a window.
+pub fn switch_to_window(hwnd: HWND) {
+    unsafe {
+        if is_iconic_window(hwnd) {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        SwitchToThisWindow(hwnd, true);
+        // Belt and braces: if the shell call is ignored for this window, the
+        // ordinary path still puts it in front.
+        if GetForegroundWindow() != hwnd {
+            set_foreground_window(hwnd);
+        }
     }
 }
 

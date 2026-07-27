@@ -9,7 +9,7 @@ use crate::uia::{notify, raise_selection_events, ListProvider, Selection};
 use crate::utils::{
     announce, check_error, get_app_icon, get_foreground_window, get_window_user_data,
     is_iconic_window, is_running_as_admin, list_windows, minimize_window, set_foreground_window,
-    set_window_user_data,
+    set_window_user_data, switch_to_window,
 };
 
 use anyhow::{anyhow, Result};
@@ -509,7 +509,7 @@ impl App {
                 // one immediately, so switching away and back restores it without
                 // waiting for the next switch-apps session to observe the focus.
                 mru::promote(&mut self.window_mru, hwnd.0 as isize);
-                set_foreground_window(hwnd);
+                switch_to_window(hwnd);
 
                 Ok(true)
             }
@@ -782,7 +782,7 @@ impl App {
                 // Remember this as the app's most-recently-used window so a later
                 // switch back to it restores this window, not the oldest one.
                 mru::promote(&mut self.window_mru, id.0 as isize);
-                set_foreground_window(id);
+                switch_to_window(id);
             }
             self.painter.unpaint(state);
         }
@@ -807,7 +807,7 @@ impl App {
             self.undo_previews(keep.map(|h| h.0 as isize));
             if restore_original {
                 if let Some(orig) = orig {
-                    set_foreground_window(orig);
+                    switch_to_window(orig);
                 }
             }
             self.painter.unpaint(state);
