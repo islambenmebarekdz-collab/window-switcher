@@ -15,13 +15,11 @@ use std::sync::LazyLock;
 use windows::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
-    System::Threading::GetCurrentThreadId,
     UI::{
         Input::KeyboardAndMouse::{SCANCODE_LSHIFT, SCANCODE_RSHIFT},
         WindowsAndMessaging::{
-            CallNextHookEx, DispatchMessageW, GetMessageW, PostMessageW, PostThreadMessageW,
-            SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, KBDLLHOOKSTRUCT, LLKHF_UP,
-            MSG, WH_KEYBOARD_LL, WM_QUIT,
+            CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+            KBDLLHOOKSTRUCT, LLKHF_UP, WH_KEYBOARD_LL,
         },
     },
 };
@@ -32,22 +30,10 @@ static WINDOW: AtomicIsize = AtomicIsize::new(0);
 static IS_SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
 static IS_SWITCHING_APPS: AtomicBool = AtomicBool::new(false);
 static PREVIOUS_KEYCODE: AtomicU32 = AtomicU32::new(0);
-/// Owns the low-level keyboard hook, which lives on a thread of its own.
-///
-/// Windows delivers `WH_KEYBOARD_LL` callbacks through the message queue of the
-/// thread that installed the hook, and drops the hook entirely if a callback
-/// cannot complete within `LowLevelHooksTimeout` (300 ms by default). Sharing a
-/// thread with the UI meant that any slow message - enumerating windows,
-/// loading icons, activating a window, waiting on a screen reader - stopped the
-/// queue from pumping, so the callback could not even be delivered and the hook
-/// was silently removed. Every hotkey then stayed dead until the app restarted.
-///
-/// This thread does nothing but pump, so no amount of work elsewhere can starve
-/// it; the hook only ever records state and posts a message.
+
 #[derive(Debug)]
 pub struct KeyboardListener {
-    thread_id: u32,
-    thread: Option<std::thread::JoinHandle<()>>,
+    hook: HHOOK,
 }
 
 impl KeyboardListener {
@@ -63,65 +49,28 @@ impl KeyboardListener {
             .collect();
         *KEYBOARD_STATE.lock() = keyboard_state;
 
-        let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-        let thread = std::thread::spawn(move || {
-            // The hook handle is not Send, so it is created, used and released
-            // entirely inside this thread.
-            let hook = unsafe {
-                match GetModuleHandleW(None) {
-                    Ok(hinstance) => SetWindowsHookExW(
-                        WH_KEYBOARD_LL,
-                        Some(keyboard_proc),
-                        Some(hinstance.into()),
-                        0,
-                    ),
-                    Err(err) => Err(err),
-                }
-            };
-            let hook = match hook {
-                Ok(hook) => {
-                    let _ = tx.send(Ok(unsafe { GetCurrentThreadId() }));
-                    hook
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(format!("Failed to set windows hook, {err}")));
-                    return;
-                }
-            };
-
-            let mut message = MSG::default();
-            // Pump until Drop posts WM_QUIT. Nothing else runs here.
-            while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
-                unsafe {
-                    let _ = TranslateMessage(&message);
-                    DispatchMessageW(&message);
-                }
-            }
-
-            let _ = unsafe { UnhookWindowsHookEx(hook) };
-        });
-
-        let thread_id = rx
-            .recv()
-            .map_err(|_| anyhow!("Keyboard hook thread stopped before reporting"))?
-            .map_err(|err| anyhow!(err))?;
-
+        let hook = unsafe {
+            let hinstance = { GetModuleHandleW(None) }
+                .map_err(|err| anyhow!("Failed to get module handle, {err}"))?;
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_proc),
+                Some(hinstance.into()),
+                0,
+            )
+        }
+        .map_err(|err| anyhow!("Failed to set windows hook, {err}"))?;
         info!("keyboard listener start");
-        Ok(Self {
-            thread_id,
-            thread: Some(thread),
-        })
+
+        Ok(Self { hook })
     }
 }
 
 impl Drop for KeyboardListener {
     fn drop(&mut self) {
         debug!("keyboard listener destroyed");
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if !self.hook.is_invalid() {
+            let _ = unsafe { UnhookWindowsHookEx(self.hook) };
         }
     }
 }
@@ -148,11 +97,10 @@ unsafe fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
 
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     let kbd_data: &KBDLLHOOKSTRUCT = &*(l_param.0 as *const _);
-    // Deliberately no logging here. This runs for every keystroke on the
-    // system, and writing a line to disk per key is slow enough to overrun
-    // LowLevelHooksTimeout, at which point Windows removes the hook and every
-    // hotkey stops working. Turning on debug logging used to kill the switcher
-    // outright for exactly this reason.
+    // No logging here: this runs for every keystroke on the system, and one
+    // disk write per key is enough to overrun LowLevelHooksTimeout, at which
+    // point Windows removes the hook and every hotkey dies until restart.
+    // Turning on debug logging used to kill the switcher outright this way.
     let mut is_modifier = false;
     let scan_code = kbd_data.scanCode;
     let is_key_pressed = || kbd_data.flags.0 & LLKHF_UP.0 == 0;
