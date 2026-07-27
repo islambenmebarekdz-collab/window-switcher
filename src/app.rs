@@ -193,7 +193,12 @@ impl App {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 PCWSTR(atom as _),
-                NAME,
+                // No window text on purpose. The overlay takes focus when the
+                // switcher opens, and a screen reader announces the name of the
+                // window it lands on - which meant hearing "Window Switcher"
+                // before every switch. With no name there is nothing to read
+                // out but the app you are actually selecting.
+                w!(""),
                 WINDOW_STYLE(0),
                 CW_USEDEFAULT,
                 CW_USEDEFAULT,

@@ -167,7 +167,10 @@ impl IRawElementProviderSimple_Impl for ListProvider_Impl {
     fn GetPropertyValue(&self, propertyid: UIA_PROPERTY_ID) -> Result<VARIANT> {
         let value = match propertyid {
             id if id == UIA_ControlTypePropertyId => VARIANT::from(UIA_ListControlTypeId.0),
-            id if id == UIA_NamePropertyId => VARIANT::from("Window Switcher"),
+            // Deliberately nameless: this container is a means to an end, and
+            // naming it only makes a screen reader say "Window Switcher" before
+            // every switch. The items carry the names worth hearing.
+            id if id == UIA_NamePropertyId => VARIANT::from(BSTR::new()),
             id if id == UIA_IsControlElementPropertyId => VARIANT::from(true),
             id if id == UIA_IsContentElementPropertyId => VARIANT::from(true),
             id if id == UIA_IsKeyboardFocusablePropertyId => VARIANT::from(true),
