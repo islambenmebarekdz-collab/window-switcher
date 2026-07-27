@@ -32,7 +32,8 @@ use windows::Win32::UI::Accessibility::{
     UIA_IsControlElementPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_ListControlTypeId,
     UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_SelectionItemPatternId,
     UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId, UiaAppendRuntimeId,
-    UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRect, UIA_PATTERN_ID, UIA_PROPERTY_ID,
+    UiaGetReservedNotSupportedValue, UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRect,
+    UIA_PATTERN_ID, UIA_PROPERTY_ID,
 };
 
 /// What the overlay currently shows: one entry per app, plus which is selected.
@@ -57,6 +58,22 @@ unsafe fn i32_safearray(values: &[i32]) -> Result<*mut SAFEARRAY> {
             SafeArrayPutElement(array, &index, value as *const i32 as *const _)?;
         }
         Ok(array)
+    }
+}
+
+/// The value UI Automation expects for a property a provider does not
+/// implement. Returning an empty variant instead makes clients treat it as a
+/// real, zero-valued answer - which is how a plain list ends up being read out
+/// with invented grid coordinates like "row 2, column 3".
+fn not_supported() -> VARIANT {
+    unsafe {
+        match UiaGetReservedNotSupportedValue() {
+            Ok(unknown) => VARIANT::from(unknown),
+            Err(err) => {
+                debug!("uia: reserved not-supported value unavailable, {err}");
+                VARIANT::default()
+            }
+        }
     }
 }
 
@@ -153,7 +170,7 @@ impl IRawElementProviderSimple_Impl for ListProvider_Impl {
             id if id == UIA_IsControlElementPropertyId => VARIANT::from(true),
             id if id == UIA_IsContentElementPropertyId => VARIANT::from(true),
             id if id == UIA_IsKeyboardFocusablePropertyId => VARIANT::from(true),
-            _ => VARIANT::default(),
+            _ => not_supported(),
         };
         Ok(value)
     }
@@ -292,7 +309,7 @@ impl IRawElementProviderSimple_Impl for ItemProvider_Impl {
             id if id == UIA_IsContentElementPropertyId => VARIANT::from(true),
             id if id == UIA_IsKeyboardFocusablePropertyId => VARIANT::from(true),
             id if id == UIA_HasKeyboardFocusPropertyId => VARIANT::from(self.is_selected()),
-            _ => VARIANT::default(),
+            _ => not_supported(),
         };
         Ok(value)
     }

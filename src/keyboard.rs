@@ -18,8 +18,8 @@ use windows::Win32::{
     UI::{
         Input::KeyboardAndMouse::{SCANCODE_LSHIFT, SCANCODE_RSHIFT},
         WindowsAndMessaging::{
-            CallNextHookEx, SendMessageTimeoutW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-            KBDLLHOOKSTRUCT, LLKHF_UP, SMTO_ABORTIFHUNG, WH_KEYBOARD_LL,
+            CallNextHookEx, PostMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+            KBDLLHOOKSTRUCT, LLKHF_UP, WH_KEYBOARD_LL,
         },
     },
 };
@@ -81,17 +81,18 @@ struct HotKeyState {
     is_modifier_pressed: bool,
 }
 
-unsafe fn send_message_timeout(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
-    let mut result: usize = 0;
-    let _ = SendMessageTimeoutW(
-        hwnd,
-        msg,
-        wparam,
-        lparam,
-        SMTO_ABORTIFHUNG,
-        500,
-        Some(&mut result as *mut _ as *mut _),
-    );
+/// Hand a hotkey action to the app window.
+///
+/// This must never block. A `WH_KEYBOARD_LL` hook that fails to return within
+/// `LowLevelHooksTimeout` (300 ms by default, and the value is usually absent
+/// from the registry) is silently removed by Windows, which kills every hotkey
+/// until the app is restarted. Sending synchronously made that a real risk once
+/// handling a hop grew to enumerating windows, loading icons, activating the
+/// target window and notifying assistive technology - any of which can stall.
+/// Posting keeps the hook instant, and since the reply was always discarded
+/// nothing is lost; the queue still delivers the messages in order.
+unsafe fn post_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) {
+    let _ = PostMessageW(Some(hwnd), msg, wparam, lparam);
 }
 
 unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
@@ -166,25 +167,25 @@ unsafe extern "system" fn keyboard_proc(code: i32, w_param: WPARAM, l_param: LPA
 
     for id in send_done_hotkeys {
         if id == SWITCH_APPS_HOTKEY_ID {
-            send_message_timeout(window, WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0));
+            post_message(window, WM_USER_SWITCH_APPS_DONE, WPARAM(0), LPARAM(0));
             IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
-            send_message_timeout(window, WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0));
+            post_message(window, WM_USER_SWITCH_WINDOWS_DONE, WPARAM(0), LPARAM(0));
         }
     }
 
     if let Some((id, reverse, is_cancel)) = send_action_message {
         if id == SWITCH_APPS_HOTKEY_ID {
             if is_cancel {
-                send_message_timeout(window, WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0));
+                post_message(window, WM_USER_SWITCH_APPS_CANCEL, WPARAM(0), LPARAM(0));
                 IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
             } else {
-                send_message_timeout(window, WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse));
+                post_message(window, WM_USER_SWITCH_APPS, WPARAM(0), LPARAM(reverse));
                 IS_SWITCHING_APPS.store(true, Ordering::Relaxed);
             }
             return LRESULT(1);
         } else if id == SWITCH_WINDOWS_HOTKEY_ID {
-            send_message_timeout(window, WM_USER_SWITCH_WINDOWS, WPARAM(0), LPARAM(reverse));
+            post_message(window, WM_USER_SWITCH_WINDOWS, WPARAM(0), LPARAM(reverse));
             IS_SWITCHING_APPS.store(false, Ordering::Relaxed);
             return LRESULT(1);
         }

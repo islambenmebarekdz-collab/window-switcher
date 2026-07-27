@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::{w, ComObject, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
     System::LibraryLoader::GetModuleHandleW,
     UI::Accessibility::{IRawElementProviderSimple, UiaReturnRawElementProvider, UiaRootObjectId},
     UI::WindowsAndMessaging::{
@@ -85,6 +86,19 @@ pub struct App {
 
 impl App {
     pub fn start(config: &Config) -> Result<()> {
+        // UI Automation delivers provider events to clients through COM, so a
+        // thread that never entered an apartment can raise events all day and
+        // every one of them is dropped on the floor - no error, no delivery.
+        // Screen readers therefore heard nothing from our accessible list.
+        // Single-threaded is the right apartment for the thread that owns the
+        // window and pumps its messages.
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if hr.is_err() {
+                error!("Failed to initialize COM, {hr:?}");
+            }
+        }
+
         let hwnd = Self::create_window()?;
         let painter = GdiAAPainter::new(hwnd)?;
 
@@ -537,15 +551,19 @@ impl App {
             let target = state.apps.get(state.index).map(|(_, h)| *h);
             let announcement = Self::announcement_for(state, announce);
             let index = state.index;
-            // Move the selection in the accessible list and tell assistive
-            // technology about it before anything else happens.
+            // Keep the accessible list in step with the selection so anything
+            // inspecting it sees the truth.
             self.uia.set_selected_index(index);
-            raise_selection_events(&self.uia);
             if accessible_list {
-                // The overlay itself holds focus in this mode, so the candidate
-                // is only activated once the user commits.
+                // The overlay itself holds focus in this mode, so it owns the
+                // announcement and the candidate is only activated on commit.
+                raise_selection_events(&self.uia);
                 self.announce_only(announcement);
             } else if let Some(hwnd) = target {
+                // Real focus is about to move to the target window, and that is
+                // what the screen reader will read. Claiming focus for our own
+                // item as well would put two focus claims in flight and make it
+                // read a mixture of the two, so the events stay silent here.
                 self.activate_candidate(hwnd, announcement);
             }
             return Ok(());
@@ -659,13 +677,11 @@ impl App {
             // Focus is taken by the caller once the overlay is actually on
             // screen, since a hidden window cannot become foreground.
             self.announce_only(announcement);
-        } else {
+        } else if let Some(hwnd) = target {
             // Actually activate the first candidate so screen readers announce
-            // it naturally through the genuine focus change.
-            raise_selection_events(&self.uia);
-            if let Some(hwnd) = target {
-                self.activate_candidate(hwnd, announcement);
-            }
+            // it naturally through the genuine focus change. No UI Automation
+            // focus event here: the real one is authoritative.
+            self.activate_candidate(hwnd, announcement);
         }
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())
