@@ -26,13 +26,14 @@ use windows::Win32::UI::Accessibility::{
     IRawElementProviderSimple, IRawElementProviderSimple_Impl, ISelectionItemProvider,
     ISelectionItemProvider_Impl, ISelectionProvider, ISelectionProvider_Impl, NavigateDirection,
     NavigateDirection_FirstChild, NavigateDirection_LastChild, NavigateDirection_NextSibling,
-    NavigateDirection_Parent, NavigateDirection_PreviousSibling, ProviderOptions,
-    ProviderOptions_ServerSideProvider, UIA_AutomationFocusChangedEventId,
-    UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId, UIA_IsContentElementPropertyId,
-    UIA_IsControlElementPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_ListControlTypeId,
-    UIA_ListItemControlTypeId, UIA_NamePropertyId, UIA_SelectionItemPatternId,
-    UIA_SelectionItem_ElementSelectedEventId, UIA_SelectionPatternId, UiaAppendRuntimeId,
-    UiaGetReservedNotSupportedValue, UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRect,
+    NavigateDirection_Parent, NavigateDirection_PreviousSibling, NotificationKind_Other,
+    NotificationProcessing_MostRecent, ProviderOptions, ProviderOptions_ServerSideProvider,
+    UIA_AutomationFocusChangedEventId, UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId,
+    UIA_IsContentElementPropertyId, UIA_IsControlElementPropertyId,
+    UIA_IsKeyboardFocusablePropertyId, UIA_ListControlTypeId, UIA_ListItemControlTypeId,
+    UIA_NamePropertyId, UIA_SelectionItemPatternId, UIA_SelectionItem_ElementSelectedEventId,
+    UIA_SelectionPatternId, UiaAppendRuntimeId, UiaGetReservedNotSupportedValue,
+    UiaHostProviderFromHwnd, UiaRaiseAutomationEvent, UiaRaiseNotificationEvent, UiaRect,
     UIA_PATTERN_ID, UIA_PROPERTY_ID,
 };
 
@@ -198,9 +199,12 @@ impl IRawElementProviderFragment_Impl for ListProvider_Impl {
     }
 
     fn GetRuntimeId(&self) -> Result<*mut SAFEARRAY> {
-        // An empty runtime id means "I am the fragment root, identify me by my
-        // window", which is what UIA expects from a host-backed root.
-        unsafe { i32_safearray(&[]) }
+        // NULL, not an empty array: it tells UI Automation to identify this
+        // fragment root by its window. An empty array is a real (empty) answer
+        // instead, which leaves the children's ids - built by appending to the
+        // root's - unresolvable, so events raised on them cannot be routed to a
+        // client and a screen reader never hears about the selection moving.
+        Ok(std::ptr::null_mut())
     }
 
     fn BoundingRectangle(&self) -> Result<UiaRect> {
@@ -209,7 +213,7 @@ impl IRawElementProviderFragment_Impl for ListProvider_Impl {
     }
 
     fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
-        unsafe { i32_safearray(&[]) }
+        Ok(std::ptr::null_mut())
     }
 
     fn SetFocus(&self) -> Result<()> {
@@ -358,7 +362,7 @@ impl IRawElementProviderFragment_Impl for ItemProvider_Impl {
     }
 
     fn GetEmbeddedFragmentRoots(&self) -> Result<*mut SAFEARRAY> {
-        unsafe { i32_safearray(&[]) }
+        Ok(std::ptr::null_mut())
     }
 
     fn SetFocus(&self) -> Result<()> {
@@ -398,6 +402,28 @@ impl ISelectionItemProvider_Impl for ItemProvider_Impl {
 ///
 /// Both events are raised because screen readers differ in which they act on:
 /// NVDA follows the focus-changed event, while others track element-selected.
+/// Ask the screen reader to speak `text`.
+///
+/// Raised on our own selected item rather than on the window's generic host
+/// provider, so the notification arrives attached to the element it is about.
+pub fn notify(root: &ComObjectRoot, text: &str) {
+    let target: IRawElementProviderSimple = match ListProvider::selected_item(root) {
+        Some(item) => item,
+        None => root.to_interface(),
+    };
+    unsafe {
+        if let Err(err) = UiaRaiseNotificationEvent(
+            &target,
+            NotificationKind_Other,
+            NotificationProcessing_MostRecent,
+            &BSTR::from(text),
+            &BSTR::from("WindowSwitcherSelection"),
+        ) {
+            debug!("uia: notification failed, {err}");
+        }
+    }
+}
+
 pub fn raise_selection_events(root: &ComObjectRoot) {
     let Some(item) = ListProvider::selected_item(root) else {
         return;

@@ -5,7 +5,7 @@ use crate::mru;
 use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
-use crate::uia::{raise_selection_events, ListProvider, Selection};
+use crate::uia::{notify, raise_selection_events, ListProvider, Selection};
 use crate::utils::{
     announce, check_error, get_app_icon, get_foreground_window, get_window_user_data,
     is_iconic_window, is_running_as_admin, list_windows, minimize_window, set_foreground_window,
@@ -736,7 +736,7 @@ impl App {
     /// accessible-list mode, where nothing is activated while cycling.
     fn announce_only(&self, announcement: Option<String>) {
         if let Some(text) = announcement {
-            announce(self.hwnd, &text);
+            notify(&self.uia, &text);
         }
     }
 
